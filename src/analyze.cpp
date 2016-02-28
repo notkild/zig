@@ -107,6 +107,18 @@ ErrorMsg *add_node_error(CodeGen *g, AstNode *node, Buf *msg) {
     return err;
 }
 
+ErrorMsg *add_error_note(CodeGen *g, ErrorMsg *parent_msg, AstNode *node, Buf *msg) {
+    // if this assert fails, then parseh generated code that
+    // failed semantic analysis, which isn't supposed to happen
+    assert(!node->owner->c_import_node);
+
+    ErrorMsg *err = err_msg_create_with_line(node->owner->path, node->line, node->column,
+            node->owner->source_code, node->owner->line_offsets, msg);
+
+    err_msg_add_note(parent_msg, err);
+    return err;
+}
+
 TypeTableEntry *new_type_table_entry(TypeTableEntryId id) {
     TypeTableEntry *entry = allocate<TypeTableEntry>(1);
     entry->arrays_by_size.init(2);
@@ -3140,7 +3152,9 @@ static VariableTableEntry *add_local_var(CodeGen *g, AstNode *source_node, Impor
 
         auto decl_entry = context->decl_table.maybe_get(name);
         if (decl_entry) {
-            add_node_error(g, source_node, buf_sprintf("redefinition of '%s'", buf_ptr(name)));
+            ErrorMsg *msg = add_node_error(g, source_node,
+                    buf_sprintf("redefinition of '%s'", buf_ptr(name)));
+            add_error_note(g, msg, decl_entry->value, buf_sprintf("previous definition is here"));
             variable_entry->type = g->builtin_types.entry_invalid;
         }
 

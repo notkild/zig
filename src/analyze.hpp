@@ -12,6 +12,7 @@
 
 void semantic_analyze(CodeGen *g);
 ErrorMsg *add_node_error(CodeGen *g, AstNode *node, Buf *msg);
+ErrorMsg *add_error_note(CodeGen *g, ErrorMsg *parent_msg, AstNode *node, Buf *msg);
 TypeTableEntry *new_type_table_entry(TypeTableEntryId id);
 TypeTableEntry *get_pointer_to_type(CodeGen *g, TypeTableEntry *child_type, bool is_const);
 BlockContext *new_block_context(AstNode *node, BlockContext *parent);
