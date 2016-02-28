@@ -1182,6 +1182,7 @@ struct BlockContext {
 
     // any variables that are introduced by this scope
     HashMap<Buf *, AstNode *, buf_hash, buf_eql_buf> decl_table;
+    HashMap<Buf *, VariableTableEntry *, buf_hash, buf_eql_buf> var_table;
 
     // if the block is inside a function, this is the function it is in:
     FnTableEntry *fn_entry;

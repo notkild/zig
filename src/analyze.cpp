@@ -34,6 +34,10 @@ static TypeTableEntry *resolve_expr_const_val_as_unsigned_num_lit(CodeGen *g, As
 static AstNode *find_decl(BlockContext *context, Buf *name);
 static TypeTableEntry *analyze_decl_ref(CodeGen *g, AstNode *source_node, AstNode *decl_node);
 static TopLevelDecl *get_as_top_level_decl(AstNode *node);
+static VariableTableEntry *analyze_variable_declaration_raw(CodeGen *g, ImportTableEntry *import,
+        BlockContext *context, AstNode *source_node,
+        AstNodeVariableDeclaration *variable_declaration,
+        bool expr_is_maybe, AstNode *decl_node);
 
 static AstNode *first_executing_node(AstNode *node) {
     switch (node->type) {
@@ -1473,6 +1477,7 @@ static void resolve_top_level_decl(CodeGen *g, AstNode *node) {
         return;
     }
     ImportTableEntry *import = tld->import;
+    assert(import);
 
     if (tld->dep_loop_flag) {
         add_node_error(g, node, buf_sprintf("'%s' depends on itself", buf_ptr(tld->name)));
@@ -1504,8 +1509,10 @@ static void resolve_top_level_decl(CodeGen *g, AstNode *node) {
             }
         case NodeTypeVariableDeclaration:
             {
-                VariableTableEntry *var = analyze_variable_declaration(g, import, import->block_context,
-                        nullptr, node);
+                AstNodeVariableDeclaration *variable_declaration = &node->data.variable_declaration;
+                VariableTableEntry *var = analyze_variable_declaration_raw(g, import, import->block_context,
+                        node, variable_declaration, false, node);
+
                 g->global_vars.append(var);
                 break;
             }
@@ -2021,7 +2028,8 @@ BlockContext *new_block_context(AstNode *node, BlockContext *parent) {
     BlockContext *context = allocate<BlockContext>(1);
     context->node = node;
     context->parent = parent;
-    context->decl_table.init(4);
+    context->decl_table.init(1);
+    context->var_table.init(1);
 
     if (parent) {
         context->parent_loop_node = parent->parent_loop_node;
@@ -2055,12 +2063,13 @@ static AstNode *find_decl(BlockContext *context, Buf *name) {
 }
 
 static VariableTableEntry *find_variable(BlockContext *context, Buf *name) {
-    AstNode *decl_node = find_decl(context, name);
-
-    if (decl_node->type == NodeTypeVariableDeclaration) {
-        return decl_node->data.variable_declaration.variable;
+    while (context) {
+        auto entry = context->var_table.maybe_get(name);
+        if (entry) {
+            return entry->value;
+        }
+        context = context->parent;
     }
-
     return nullptr;
 }
 
@@ -2607,6 +2616,21 @@ static TypeTableEntry *analyze_error_literal_expr(CodeGen *g, ImportTableEntry *
     return g->builtin_types.entry_invalid;
 }
 
+static TypeTableEntry *analyze_var_ref(CodeGen *g, AstNode *source_node, VariableTableEntry *var) {
+    get_resolved_expr(source_node)->variable = var;
+    if (var->is_const) {
+        AstNode *decl_node = var->decl_node;
+        if (decl_node->type == NodeTypeVariableDeclaration) {
+            AstNode *expr_node = decl_node->data.variable_declaration.expr;
+            ConstExprValue *other_const_val = &get_resolved_expr(expr_node)->const_val;
+            if (other_const_val->ok) {
+                return resolve_expr_const_val_as_other_expr(g, source_node, expr_node);
+            }
+        }
+    }
+    return var->type;
+}
+
 static TypeTableEntry *analyze_decl_ref(CodeGen *g, AstNode *source_node, AstNode *decl_node) {
     resolve_top_level_decl(g, decl_node);
     TopLevelDecl *tld = get_as_top_level_decl(decl_node);
@@ -2616,18 +2640,7 @@ static TypeTableEntry *analyze_decl_ref(CodeGen *g, AstNode *source_node, AstNod
 
     if (decl_node->type == NodeTypeVariableDeclaration) {
         VariableTableEntry *var = decl_node->data.variable_declaration.variable;
-        get_resolved_expr(source_node)->variable = var;
-        if (var->is_const) {
-            AstNode *decl_node = var->decl_node;
-            if (decl_node->type == NodeTypeVariableDeclaration) {
-                AstNode *expr_node = decl_node->data.variable_declaration.expr;
-                ConstExprValue *other_const_val = &get_resolved_expr(expr_node)->const_val;
-                if (other_const_val->ok) {
-                    return resolve_expr_const_val_as_other_expr(g, source_node, expr_node);
-                }
-            }
-        }
-        return var->type;
+        return analyze_var_ref(g, source_node, var);
     } else if (decl_node->type == NodeTypeFnProto) {
         FnTableEntry *fn_entry = decl_node->data.fn_proto.fn_table_entry;
         assert(fn_entry->type_entry);
@@ -2653,6 +2666,11 @@ static TypeTableEntry *analyze_symbol_expr(CodeGen *g, ImportTableEntry *import,
     auto primitive_table_entry = g->primitive_type_table.maybe_get(variable_name);
     if (primitive_table_entry) {
         return resolve_expr_const_val_as_type(g, node, primitive_table_entry->value);
+    }
+
+    VariableTableEntry *var = find_variable(context, variable_name);
+    if (var) {
+        return analyze_var_ref(g, node, var);
     }
 
     AstNode *decl_node = find_decl(context, variable_name);
@@ -3144,22 +3162,36 @@ static VariableTableEntry *add_local_var(CodeGen *g, AstNode *source_node, Impor
     variable_entry->type = type_entry;
     variable_entry->block_context = context;
 
-    AstNode *var_node = create_ast_node(g, import, NodeTypeVariableDeclaration);
-    var_node->data.variable_declaration.variable = variable_entry;
-
     if (name) {
         buf_init_from_buf(&variable_entry->name, name);
 
-        auto decl_entry = context->decl_table.maybe_get(name);
-        if (decl_entry) {
+        VariableTableEntry *existing_var = find_variable(context, name);
+        if (existing_var) {
             ErrorMsg *msg = add_node_error(g, source_node,
-                    buf_sprintf("redefinition of '%s'", buf_ptr(name)));
-            add_error_note(g, msg, decl_entry->value, buf_sprintf("previous definition is here"));
+                    buf_sprintf("redeclaration of variable '%s'", buf_ptr(name)));
+            add_error_note(g, msg, existing_var->decl_node, buf_sprintf("previous declaration is here"));
             variable_entry->type = g->builtin_types.entry_invalid;
+        } else {
+            auto primitive_table_entry = g->primitive_type_table.maybe_get(name);
+            if (primitive_table_entry) {
+                TypeTableEntry *type = primitive_table_entry->value;
+                add_node_error(g, source_node,
+                        buf_sprintf("variable shadows type '%s'", buf_ptr(&type->name)));
+                variable_entry->type = g->builtin_types.entry_invalid;
+            } else {
+                AstNode *decl_node = find_decl(context, name);
+                if (decl_node && decl_node->type != NodeTypeVariableDeclaration) {
+                    ErrorMsg *msg = add_node_error(g, source_node,
+                            buf_sprintf("redefinition of '%s'", buf_ptr(name)));
+                    add_error_note(g, msg, decl_node, buf_sprintf("previous definition is here"));
+                    variable_entry->type = g->builtin_types.entry_invalid;
+                }
+            }
         }
 
-        context->decl_table.put(&variable_entry->name, var_node);
+        context->var_table.put(&variable_entry->name, variable_entry);
     } else {
+        // TODO replace _anon with @anon and make sure all tests still pass
         buf_init_from_str(&variable_entry->name, "_anon");
     }
     if (context->fn_entry) {
@@ -3209,7 +3241,7 @@ static TypeTableEntry *analyze_unwrap_error_expr(CodeGen *g, ImportTableEntry *i
 static VariableTableEntry *analyze_variable_declaration_raw(CodeGen *g, ImportTableEntry *import,
         BlockContext *context, AstNode *source_node,
         AstNodeVariableDeclaration *variable_declaration,
-        bool expr_is_maybe)
+        bool expr_is_maybe, AstNode *decl_node)
 {
     bool is_const = variable_declaration->is_const;
     bool is_export = (variable_declaration->top_level_decl.visib_mod == VisibModExport);
@@ -3280,7 +3312,7 @@ static VariableTableEntry *analyze_variable_declaration(CodeGen *g, ImportTableE
         BlockContext *context, TypeTableEntry *expected_type, AstNode *node)
 {
     AstNodeVariableDeclaration *variable_declaration = &node->data.variable_declaration;
-    return analyze_variable_declaration_raw(g, import, context, node, variable_declaration, false);
+    return analyze_variable_declaration_raw(g, import, context, node, variable_declaration, false, nullptr);
 }
 
 static TypeTableEntry *analyze_null_literal_expr(CodeGen *g, ImportTableEntry *import,
@@ -3461,7 +3493,8 @@ static TypeTableEntry *analyze_for_expr(CodeGen *g, ImportTableEntry *import, Bl
     AstNode *elem_var_node = node->data.for_expr.elem_node;
     elem_var_node->block_context = child_context;
     Buf *elem_var_name = &elem_var_node->data.symbol_expr.symbol;
-    node->data.for_expr.elem_var = add_local_var(g, elem_var_node, import, child_context, elem_var_name, child_type, true);
+    node->data.for_expr.elem_var = add_local_var(g, elem_var_node, import, child_context, elem_var_name,
+            child_type, true);
 
     AstNode *index_var_node = node->data.for_expr.index_node;
     if (index_var_node) {
@@ -3618,7 +3651,8 @@ static TypeTableEntry *analyze_if_var_expr(CodeGen *g, ImportTableEntry *import,
 
     BlockContext *child_context = new_block_context(node, parent_context);
 
-    analyze_variable_declaration_raw(g, import, child_context, node, &node->data.if_var_expr.var_decl, true);
+    analyze_variable_declaration_raw(g, import, child_context, node, &node->data.if_var_expr.var_decl, true,
+        nullptr);
     VariableTableEntry *var = node->data.if_var_expr.var_decl.variable;
     if (var->type->id == TypeTableEntryIdInvalid) {
         return g->builtin_types.entry_invalid;
@@ -5248,7 +5282,8 @@ static void analyze_fn_body(CodeGen *g, FnTableEntry *fn_table_entry) {
             add_node_error(g, param_decl_node, buf_sprintf("missing parameter name"));
         }
 
-        VariableTableEntry *var = add_local_var(g, param_decl_node, import, context, &param_decl->name, type, true);
+        VariableTableEntry *var = add_local_var(g, param_decl_node, import, context, &param_decl->name,
+                type, true);
         var->src_arg_index = i;
         param_decl_node->data.param_decl.variable = var;
 
@@ -5264,6 +5299,8 @@ static void analyze_fn_body(CodeGen *g, FnTableEntry *fn_table_entry) {
 static void add_top_level_decl(CodeGen *g, ImportTableEntry *import, BlockContext *block_context,
         AstNode *node, Buf *name)
 {
+    assert(import);
+
     TopLevelDecl *tld = get_as_top_level_decl(node);
     tld->import = import;
     tld->name = name;
@@ -5273,7 +5310,15 @@ static void add_top_level_decl(CodeGen *g, ImportTableEntry *import, BlockContex
     }
 
     node->block_context = block_context;
-    block_context->decl_table.put(name, node);
+
+    auto entry = block_context->decl_table.maybe_get(name);
+    if (entry) {
+        AstNode *other_decl_node = entry->value;
+        ErrorMsg *msg = add_node_error(g, node, buf_sprintf("redefinition of '%s'", buf_ptr(name)));
+        add_error_note(g, msg, other_decl_node, buf_sprintf("previous definition is here"));
+    } else {
+        block_context->decl_table.put(name, node);
+    }
 }
 
 static void scan_decls(CodeGen *g, ImportTableEntry *import, BlockContext *context, AstNode *node) {
