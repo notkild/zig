@@ -47,6 +47,14 @@ static void init_darwin_native(CodeGen *g) {
     }
 }
 
+static PackageTableEntry *new_package(const char *root_src_dir, const char *root_src_path) {
+    PackageTableEntry *entry = allocate<PackageTableEntry>(1);
+    entry->package_table.init(4);
+    buf_init_from_str(&entry->root_src_dir, root_src_dir);
+    buf_init_from_str(&entry->root_src_path, root_src_path);
+    return entry;
+}
+
 CodeGen *codegen_create(Buf *root_source_dir, const ZigTarget *target) {
     CodeGen *g = allocate<CodeGen>(1);
     g->import_table.init(32);
@@ -56,8 +64,12 @@ CodeGen *codegen_create(Buf *root_source_dir, const ZigTarget *target) {
     g->error_table.init(16);
     g->is_release_build = false;
     g->is_test_build = false;
-    g->root_source_dir = root_source_dir;
     g->error_value_count = 1;
+
+    g->root_package = new_package(buf_ptr(root_source_dir), "");
+    g->std_package = new_package(ZIG_STD_DIR, "index.zig");
+    g->root_package->package_table.put(buf_create_from_str("std"), g->std_package);
+
 
     if (target) {
         // cross compiling, so we can't rely on all the configured stuff since
@@ -3309,6 +3321,12 @@ static void define_builtin_types(CodeGen *g) {
         g->builtin_types.entry_invalid = entry;
     }
     {
+        TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdNamespace);
+        buf_init_from_str(&entry->name, "(namespace)");
+        entry->zero_bits = true;
+        g->builtin_types.entry_namespace = entry;
+    }
+    {
         TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdNumLitFloat);
         buf_init_from_str(&entry->name, "(float literal)");
         entry->zero_bits = true;
@@ -3709,9 +3727,6 @@ static void define_builtin_fns(CodeGen *g) {
 }
 
 static void init(CodeGen *g, Buf *source_path) {
-    g->lib_search_paths.append(g->root_source_dir);
-    g->lib_search_paths.append(buf_create_from_str(ZIG_STD_DIR));
-
     g->module = LLVMModuleCreateWithName(buf_ptr(source_path));
 
     get_target_triple(&g->triple_str, &g->zig_target);
@@ -3762,7 +3777,7 @@ static void init(CodeGen *g, Buf *source_path) {
     const char *flags = "";
     unsigned runtime_version = 0;
     g->compile_unit = LLVMZigCreateCompileUnit(g->dbuilder, LLVMZigLang_DW_LANG_C99(),
-            buf_ptr(source_path), buf_ptr(g->root_source_dir),
+            buf_ptr(source_path), buf_ptr(&g->root_package->root_src_dir),
             buf_ptr(producer), is_optimized, flags, runtime_version,
             "", 0, !g->strip_debug_symbols);
 
@@ -3825,7 +3840,7 @@ static ImportTableEntry *add_special_code(CodeGen *g, const char *basename) {
         zig_panic("unable to open '%s': %s", buf_ptr(&path_to_code_src), err_str(err));
     }
 
-    return add_source_file(g, abs_full_path, std_dir, code_basename, import_code);
+    return add_source_file(g, g->std_package, abs_full_path, std_dir, code_basename, import_code);
 }
 
 void codegen_add_root_code(CodeGen *g, Buf *src_dir, Buf *src_basename, Buf *source_code) {
@@ -3839,7 +3854,7 @@ void codegen_add_root_code(CodeGen *g, Buf *src_dir, Buf *src_basename, Buf *sou
         zig_panic("unable to open '%s': %s", buf_ptr(&source_path), err_str(err));
     }
 
-    g->root_import = add_source_file(g, abs_full_path, src_dir, src_basename, source_code);
+    g->root_import = add_source_file(g, g->root_package, abs_full_path, src_dir, src_basename, source_code);
 
     assert(g->root_out_name);
     assert(g->out_type != OutTypeUnknown);

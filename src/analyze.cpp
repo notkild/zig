@@ -4050,6 +4050,86 @@ static TypeTableEntry *analyze_cast_expr(CodeGen *g, ImportTableEntry *import, B
     return g->builtin_types.entry_invalid;
 }
 
+static TypeTableEntry *resolve_expr_const_val_as_import(CodeGen *g, AstNode *node, ImportTableEntry *import) {
+    Expr *expr = get_resolved_expr(node);
+    expr->const_val.ok = true;
+    expr->const_val.data.x_import = import;
+    return g->builtin_types.entry_namespace;
+}
+
+static TypeTableEntry *analyze_import(CodeGen *g, ImportTableEntry *import, BlockContext *context,
+        AstNode *node)
+{
+    assert(node->type == NodeTypeFnCallExpr);
+
+    if (context != import->block_context) {
+        add_node_error(g, node, buf_sprintf("@import valid only at top level scope"));
+        return g->builtin_types.entry_invalid;
+    }
+
+    AstNode *first_param_node = node->data.fn_call_expr.params.at(0);
+    Buf *import_target_str = resolve_const_expr_str(g, import, context, first_param_node->parent_field);
+    if (!import_target_str) {
+        return g->builtin_types.entry_invalid;
+    }
+
+    Buf *import_target_path;
+    Buf *search_dir;
+    assert(import->package);
+    PackageTableEntry *target_package;
+    auto package_entry = import->package->package_table.maybe_get(import_target_str);
+    if (package_entry) {
+        target_package = package_entry->value;
+        import_target_path = &target_package->root_src_path;
+        search_dir = &target_package->root_src_dir;
+    } else {
+        // try it as a filename
+        target_package = import->package;
+        import_target_path = import_target_str;
+        search_dir = &import->package->root_src_dir;
+    }
+
+    Buf full_path = BUF_INIT;
+    os_path_join(search_dir, import_target_path, &full_path);
+
+    Buf *import_code = buf_alloc();
+    Buf *abs_full_path = buf_alloc();
+    int err;
+    if ((err = os_path_real(&full_path, abs_full_path))) {
+        if (err == ErrorFileNotFound) {
+            add_node_error(g, node,
+                    buf_sprintf("unable to find '%s'", buf_ptr(import_target_path)));
+            return g->builtin_types.entry_invalid;
+        } else {
+            g->error_during_imports = true;
+            add_node_error(g, node,
+                    buf_sprintf("unable to open '%s': %s", buf_ptr(&full_path), err_str(err)));
+            return g->builtin_types.entry_invalid;
+        }
+    }
+
+    auto import_entry = g->import_table.maybe_get(abs_full_path);
+    if (import_entry) {
+        return resolve_expr_const_val_as_import(g, node, import_entry->value);
+    }
+
+    if ((err = os_fetch_file_path(abs_full_path, import_code))) {
+        if (err == ErrorFileNotFound) {
+            add_node_error(g, node,
+                    buf_sprintf("unable to find '%s'", buf_ptr(import_target_path)));
+            return g->builtin_types.entry_invalid;
+        } else {
+            add_node_error(g, node,
+                    buf_sprintf("unable to open '%s': %s", buf_ptr(&full_path), err_str(err)));
+            return g->builtin_types.entry_invalid;
+        }
+    }
+    ImportTableEntry *target_import = add_source_file(g, target_package,
+            abs_full_path, search_dir, import_target_path, import_code);
+
+    return resolve_expr_const_val_as_import(g, node, target_import);
+}
+
 static TypeTableEntry *analyze_builtin_fn_call_expr(CodeGen *g, ImportTableEntry *import, BlockContext *context,
         TypeTableEntry *expected_type, AstNode *node)
 {
@@ -4374,7 +4454,7 @@ static TypeTableEntry *analyze_builtin_fn_call_expr(CodeGen *g, ImportTableEntry
                 }
             }
         case BuiltinFnIdImport:
-            zig_panic("TODO @import");
+            return analyze_import(g, import, context, node);
         case BuiltinFnIdCImport:
             zig_panic("TODO @c_import");
 
@@ -5427,8 +5507,8 @@ static void scan_decls(CodeGen *g, ImportTableEntry *import, BlockContext *conte
     }
 }
 
-ImportTableEntry *add_source_file(CodeGen *g, Buf *abs_full_path,
-        Buf *src_dirname, Buf *src_basename, Buf *source_code)
+ImportTableEntry *add_source_file(CodeGen *g, PackageTableEntry *package,
+        Buf *abs_full_path, Buf *src_dirname, Buf *src_basename, Buf *source_code)
 {
     Buf *full_path = buf_alloc();
     os_path_join(src_dirname, src_basename, full_path);
@@ -5461,6 +5541,7 @@ ImportTableEntry *add_source_file(CodeGen *g, Buf *abs_full_path,
     }
 
     ImportTableEntry *import_entry = allocate<ImportTableEntry>(1);
+    import_entry->package = package;
     import_entry->source_code = source_code;
     import_entry->line_offsets = tokenization.line_offsets;
     import_entry->path = full_path;

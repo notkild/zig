@@ -76,6 +76,7 @@ struct ConstExprValue {
         ConstStructValue x_struct;
         ConstArrayValue x_array;
         ConstPtrValue x_ptr;
+        ImportTableEntry *x_import;
     } data;
 };
 
@@ -961,9 +962,18 @@ struct ImporterInfo {
     AstNode *source_node;
 };
 
+struct PackageTableEntry {
+    Buf root_src_dir;
+    Buf root_src_path; // relative to root_src_dir
+
+    // reminder: hash tables must be initialized before use
+    HashMap<Buf *, PackageTableEntry *, buf_hash, buf_eql_buf> package_table;
+};
+
 struct ImportTableEntry {
     AstNode *root;
-    Buf *path; // relative to root_source_dir
+    Buf *path; // relative to root_package->root_src_dir
+    PackageTableEntry *package;
     LLVMZigDIFile *di_file;
     Buf *source_code;
     ZigList<int> *line_offsets;
@@ -974,6 +984,7 @@ struct ImportTableEntry {
 
     // reminder: hash tables must be initialized before use
     HashMap<Buf *, ErrorTableEntry *, buf_hash, buf_eql_buf> error_table;
+
 };
 
 struct FnTableEntry {
@@ -1036,7 +1047,6 @@ struct CodeGen {
     LLVMZigDIBuilder *dbuilder;
     LLVMZigDICompileUnit *compile_unit;
 
-    ZigList<Buf *> lib_search_paths;
     ZigList<Buf *> link_libs; // non-libc link libs
 
     // reminder: hash tables must be initialized before use
@@ -1074,6 +1084,7 @@ struct CodeGen {
         TypeTableEntry *entry_unreachable;
         TypeTableEntry *entry_type;
         TypeTableEntry *entry_invalid;
+        TypeTableEntry *entry_namespace;
         TypeTableEntry *entry_num_lit_int;
         TypeTableEntry *entry_num_lit_float;
         TypeTableEntry *entry_undef;
@@ -1105,7 +1116,8 @@ struct CodeGen {
     LLVMTargetMachineRef target_machine;
     LLVMZigDIFile *dummy_di_file;
     bool is_native_target;
-    Buf *root_source_dir;
+    PackageTableEntry *root_package;
+    PackageTableEntry *std_package;
     Buf *root_out_name;
     bool windows_subsystem_windows;
     bool windows_subsystem_console;
