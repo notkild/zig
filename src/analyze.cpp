@@ -3165,26 +3165,28 @@ static VariableTableEntry *add_local_var(CodeGen *g, AstNode *source_node, Impor
     if (name) {
         buf_init_from_buf(&variable_entry->name, name);
 
-        VariableTableEntry *existing_var = find_variable(context, name);
-        if (existing_var) {
-            ErrorMsg *msg = add_node_error(g, source_node,
-                    buf_sprintf("redeclaration of variable '%s'", buf_ptr(name)));
-            add_error_note(g, msg, existing_var->decl_node, buf_sprintf("previous declaration is here"));
-            variable_entry->type = g->builtin_types.entry_invalid;
-        } else {
-            auto primitive_table_entry = g->primitive_type_table.maybe_get(name);
-            if (primitive_table_entry) {
-                TypeTableEntry *type = primitive_table_entry->value;
-                add_node_error(g, source_node,
-                        buf_sprintf("variable shadows type '%s'", buf_ptr(&type->name)));
+        if (type_entry->id != TypeTableEntryIdInvalid) {
+            VariableTableEntry *existing_var = find_variable(context, name);
+            if (existing_var) {
+                ErrorMsg *msg = add_node_error(g, source_node,
+                        buf_sprintf("redeclaration of variable '%s'", buf_ptr(name)));
+                add_error_note(g, msg, existing_var->decl_node, buf_sprintf("previous declaration is here"));
                 variable_entry->type = g->builtin_types.entry_invalid;
             } else {
-                AstNode *decl_node = find_decl(context, name);
-                if (decl_node && decl_node->type != NodeTypeVariableDeclaration) {
-                    ErrorMsg *msg = add_node_error(g, source_node,
-                            buf_sprintf("redefinition of '%s'", buf_ptr(name)));
-                    add_error_note(g, msg, decl_node, buf_sprintf("previous definition is here"));
+                auto primitive_table_entry = g->primitive_type_table.maybe_get(name);
+                if (primitive_table_entry) {
+                    TypeTableEntry *type = primitive_table_entry->value;
+                    add_node_error(g, source_node,
+                            buf_sprintf("variable shadows type '%s'", buf_ptr(&type->name)));
                     variable_entry->type = g->builtin_types.entry_invalid;
+                } else {
+                    AstNode *decl_node = find_decl(context, name);
+                    if (decl_node && decl_node->type != NodeTypeVariableDeclaration) {
+                        ErrorMsg *msg = add_node_error(g, source_node,
+                                buf_sprintf("redefinition of '%s'", buf_ptr(name)));
+                        add_error_note(g, msg, decl_node, buf_sprintf("previous definition is here"));
+                        variable_entry->type = g->builtin_types.entry_invalid;
+                    }
                 }
             }
         }
