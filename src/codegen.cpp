@@ -52,7 +52,6 @@ CodeGen *codegen_create(Buf *root_source_dir, const ZigTarget *target) {
     g->import_table.init(32);
     g->builtin_fn_table.init(32);
     g->primitive_type_table.init(32);
-    g->unresolved_top_level_decls.init(32);
     g->fn_type_table.init(32);
     g->error_table.init(16);
     g->is_release_build = false;
@@ -155,6 +154,14 @@ void codegen_set_linker_path(CodeGen *g, Buf *linker_path) {
 
 void codegen_add_lib_dir(CodeGen *g, const char *dir) {
     g->lib_dirs.append(dir);
+}
+
+void codegen_add_link_lib(CodeGen *g, const char *lib) {
+    if (strcmp(lib, "c") == 0) {
+        g->link_libc = true;
+    } else {
+        g->link_libs.append(buf_create_from_str(lib));
+    }
 }
 
 void codegen_set_windows_subsystem(CodeGen *g, bool mwindows, bool mconsole) {
@@ -316,6 +323,8 @@ static LLVMValueRef gen_builtin_fn_call_expr(CodeGen *g, AstNode *node) {
         case BuiltinFnIdCInclude:
         case BuiltinFnIdCDefine:
         case BuiltinFnIdCUndef:
+        case BuiltinFnIdImport:
+        case BuiltinFnIdCImport:
             zig_unreachable();
         case BuiltinFnIdCtz:
         case BuiltinFnIdClz:
@@ -844,7 +853,7 @@ static LLVMValueRef gen_field_ptr(CodeGen *g, AstNode *node, TypeTableEntry **ou
 
     LLVMValueRef struct_ptr;
     if (struct_expr_node->type == NodeTypeSymbol) {
-        VariableTableEntry *var = struct_expr_node->data.symbol_expr.variable;
+        VariableTableEntry *var = get_resolved_expr(struct_expr_node)->variable;
         assert(var);
 
         if (var->is_ptr && var->type->id == TypeTableEntryIdPointer) {
@@ -1027,7 +1036,7 @@ static LLVMValueRef gen_lvalue(CodeGen *g, AstNode *expr_node, AstNode *node,
     LLVMValueRef target_ref;
 
     if (node->type == NodeTypeSymbol) {
-        VariableTableEntry *var = node->data.symbol_expr.variable;
+        VariableTableEntry *var = get_resolved_expr(node)->variable;
         assert(var);
 
         *out_type_entry = var->type;
@@ -2468,7 +2477,7 @@ static LLVMValueRef gen_var_decl_expr(CodeGen *g, AstNode *node) {
 
 static LLVMValueRef gen_symbol(CodeGen *g, AstNode *node) {
     assert(node->type == NodeTypeSymbol);
-    VariableTableEntry *variable = node->data.symbol_expr.variable;
+    VariableTableEntry *variable = get_resolved_expr(node)->variable;
     if (variable) {
         if (!type_has_bits(variable->type)) {
             return nullptr;
@@ -2480,9 +2489,13 @@ static LLVMValueRef gen_symbol(CodeGen *g, AstNode *node) {
         }
     }
 
+    zig_unreachable();
+
+    /* TODO delete
     FnTableEntry *fn_entry = node->data.symbol_expr.fn_entry;
     assert(fn_entry);
     return fn_entry->fn_value;
+    */
 }
 
 static LLVMValueRef gen_switch_expr(CodeGen *g, AstNode *node) {
@@ -2703,14 +2716,12 @@ static LLVMValueRef gen_expr(CodeGen *g, AstNode *node) {
             // caught by constant expression eval codegen
             zig_unreachable();
         case NodeTypeRoot:
-        case NodeTypeRootExportDecl:
         case NodeTypeFnProto:
         case NodeTypeFnDef:
         case NodeTypeFnDecl:
         case NodeTypeParamDecl:
         case NodeTypeDirective:
-        case NodeTypeImport:
-        case NodeTypeCImport:
+        case NodeTypeUse:
         case NodeTypeStructDecl:
         case NodeTypeStructField:
         case NodeTypeStructValueField:
@@ -2891,6 +2902,7 @@ static LLVMValueRef gen_const_val(CodeGen *g, TypeTableEntry *type_entry, ConstE
         case TypeTableEntryIdNumLitInt:
         case TypeTableEntryIdUndefLit:
         case TypeTableEntryIdVoid:
+        case TypeTableEntryIdNamespace:
             zig_unreachable();
 
     }
@@ -2943,14 +2955,14 @@ static bool skip_fn_codegen(CodeGen *g, FnTableEntry *fn_entry) {
         if (fn_entry == g->main_fn) {
             return true;
         }
-        return fn_entry->ref_count == 0;
+        return false;
     }
 
     if (fn_entry->is_test) {
         return true;
     }
 
-    return fn_entry->ref_count == 0;
+    return false;
 }
 
 static LLVMValueRef gen_test_fn_val(CodeGen *g, FnTableEntry *fn_entry) {
@@ -3499,14 +3511,6 @@ static void define_builtin_types(CodeGen *g) {
         g->builtin_types.entry_type = entry;
         g->primitive_type_table.put(&entry->name, entry);
     }
-    {
-        // partially complete the error type. we complete it later after we know
-        // error_value_count.
-        TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdPureError);
-        buf_init_from_str(&entry->name, "error");
-        g->builtin_types.entry_pure_error = entry;
-        g->primitive_type_table.put(&entry->name, entry);
-    }
 
     g->builtin_types.entry_u8 = get_int_type(g, false, 8);
     g->builtin_types.entry_u16 = get_int_type(g, false, 16);
@@ -3516,6 +3520,21 @@ static void define_builtin_types(CodeGen *g) {
     g->builtin_types.entry_i16 = get_int_type(g, true, 16);
     g->builtin_types.entry_i32 = get_int_type(g, true, 32);
     g->builtin_types.entry_i64 = get_int_type(g, true, 64);
+
+    {
+        TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdPureError);
+        buf_init_from_str(&entry->name, "error");
+
+        // TODO allow overriding this type and keep track of max value and emit an
+        // error if there are too many errors declared
+        g->err_tag_type = g->builtin_types.entry_u16;
+
+        g->builtin_types.entry_pure_error = entry;
+        entry->type_ref = g->err_tag_type->type_ref;
+        entry->di_type = g->err_tag_type->di_type;
+
+        g->primitive_type_table.put(&entry->name, entry);
+    }
 
     {
         TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdEnum);
@@ -3685,6 +3704,8 @@ static void define_builtin_fns(CodeGen *g) {
     create_builtin_fn_with_arg_count(g, BuiltinFnIdConstEval, "const_eval", 1);
     create_builtin_fn_with_arg_count(g, BuiltinFnIdCtz, "ctz", 2);
     create_builtin_fn_with_arg_count(g, BuiltinFnIdClz, "clz", 2);
+    create_builtin_fn_with_arg_count(g, BuiltinFnIdImport, "import", 1);
+    create_builtin_fn_with_arg_count(g, BuiltinFnIdCImport, "c_import", 1);
 }
 
 static void init(CodeGen *g, Buf *source_path) {
@@ -3761,8 +3782,6 @@ void codegen_parseh(CodeGen *g, Buf *src_dirname, Buf *src_basename, Buf *source
     ImportTableEntry *import = allocate<ImportTableEntry>(1);
     import->source_code = source_code;
     import->path = full_path;
-    import->fn_table.init(32);
-    import->type_table.init(8);
     import->error_table.init(8);
     g->root_import = import;
 
@@ -3791,213 +3810,6 @@ void codegen_render_ast(CodeGen *g, FILE *f, int indent_size) {
 }
 
 
-static int parse_version_string(Buf *buf, int *major, int *minor, int *patch) {
-    char *dot1 = strstr(buf_ptr(buf), ".");
-    if (!dot1)
-        return ErrorInvalidFormat;
-    char *dot2 = strstr(dot1 + 1, ".");
-    if (!dot2)
-        return ErrorInvalidFormat;
-
-    *major = (int)strtol(buf_ptr(buf), nullptr, 10);
-    *minor = (int)strtol(dot1 + 1, nullptr, 10);
-    *patch = (int)strtol(dot2 + 1, nullptr, 10);
-
-    return ErrorNone;
-}
-
-static void set_root_export_version(CodeGen *g, Buf *version_buf, AstNode *node) {
-    int err;
-    if ((err = parse_version_string(version_buf, &g->version_major, &g->version_minor, &g->version_patch))) {
-        add_node_error(g, node,
-                buf_sprintf("invalid version string"));
-    }
-}
-
-
-static ImportTableEntry *codegen_add_code(CodeGen *g, Buf *abs_full_path,
-        Buf *src_dirname, Buf *src_basename, Buf *source_code)
-{
-    int err;
-    Buf *full_path = buf_alloc();
-    os_path_join(src_dirname, src_basename, full_path);
-
-    if (g->verbose) {
-        fprintf(stderr, "\nOriginal Source (%s):\n", buf_ptr(full_path));
-        fprintf(stderr, "----------------\n");
-        fprintf(stderr, "%s\n", buf_ptr(source_code));
-
-        fprintf(stderr, "\nTokens:\n");
-        fprintf(stderr, "---------\n");
-    }
-
-    Tokenization tokenization = {0};
-    tokenize(source_code, &tokenization);
-
-    if (tokenization.err) {
-        ErrorMsg *err = err_msg_create_with_line(full_path, tokenization.err_line, tokenization.err_column,
-                source_code, tokenization.line_offsets, tokenization.err);
-
-        print_err_msg(err, g->err_color);
-        exit(1);
-    }
-
-    if (g->verbose) {
-        print_tokens(source_code, tokenization.tokens);
-
-        fprintf(stderr, "\nAST:\n");
-        fprintf(stderr, "------\n");
-    }
-
-    ImportTableEntry *import_entry = allocate<ImportTableEntry>(1);
-    import_entry->source_code = source_code;
-    import_entry->line_offsets = tokenization.line_offsets;
-    import_entry->path = full_path;
-    import_entry->fn_table.init(32);
-    import_entry->type_table.init(8);
-    import_entry->error_table.init(8);
-
-    import_entry->root = ast_parse(source_code, tokenization.tokens, import_entry, g->err_color,
-            &g->next_node_index);
-    assert(import_entry->root);
-    if (g->verbose) {
-        ast_print(stderr, import_entry->root, 0);
-    }
-
-    import_entry->di_file = LLVMZigCreateFile(g->dbuilder, buf_ptr(src_basename), buf_ptr(src_dirname));
-    g->import_table.put(abs_full_path, import_entry);
-
-    import_entry->block_context = new_block_context(import_entry->root, nullptr);
-    import_entry->block_context->di_scope = LLVMZigFileToScope(import_entry->di_file);
-
-
-    assert(import_entry->root->type == NodeTypeRoot);
-    for (int decl_i = 0; decl_i < import_entry->root->data.root.top_level_decls.length; decl_i += 1) {
-        AstNode *top_level_decl = import_entry->root->data.root.top_level_decls.at(decl_i);
-
-        if (top_level_decl->type == NodeTypeRootExportDecl) {
-            if (g->root_import) {
-                add_node_error(g, top_level_decl,
-                        buf_sprintf("root export declaration only valid in root source file"));
-            } else {
-                ZigList<AstNode *> *directives = top_level_decl->data.root_export_decl.directives;
-                if (directives) {
-                    for (int i = 0; i < directives->length; i += 1) {
-                        AstNode *directive_node = directives->at(i);
-                        Buf *name = &directive_node->data.directive.name;
-                        AstNode *param_node = directive_node->data.directive.expr;
-                        assert(param_node->type == NodeTypeStringLiteral);
-                        Buf *param = &param_node->data.string_literal.buf;
-
-                        if (param) {
-                            if (buf_eql_str(name, "version")) {
-                                set_root_export_version(g, param, directive_node);
-                            } else if (buf_eql_str(name, "link")) {
-                                if (buf_eql_str(param, "c")) {
-                                    g->link_libc = true;
-                                } else {
-                                    g->link_libs.append(param);
-                                }
-                            } else {
-                                add_node_error(g, directive_node,
-                                        buf_sprintf("invalid directive: '%s'", buf_ptr(name)));
-                            }
-                        }
-                    }
-                }
-
-                if (g->root_export_decl) {
-                    add_node_error(g, top_level_decl,
-                            buf_sprintf("only one root export declaration allowed"));
-                } else {
-                    g->root_export_decl = top_level_decl;
-
-                    if (!g->root_out_name)
-                        g->root_out_name = &top_level_decl->data.root_export_decl.name;
-
-                    Buf *out_type = &top_level_decl->data.root_export_decl.type;
-                    OutType export_out_type;
-                    if (buf_eql_str(out_type, "executable")) {
-                        export_out_type = OutTypeExe;
-                    } else if (buf_eql_str(out_type, "library")) {
-                        export_out_type = OutTypeLib;
-                    } else if (buf_eql_str(out_type, "object")) {
-                        export_out_type = OutTypeObj;
-                    } else {
-                        add_node_error(g, top_level_decl,
-                                buf_sprintf("invalid export type: '%s'", buf_ptr(out_type)));
-                    }
-                    if (g->out_type == OutTypeUnknown) {
-                        g->out_type = export_out_type;
-                    }
-                }
-            }
-        } else if (top_level_decl->type == NodeTypeImport) {
-            Buf *import_target_path = &top_level_decl->data.import.path;
-            Buf full_path = BUF_INIT;
-            Buf *import_code = buf_alloc();
-            bool found_it = false;
-
-            for (int path_i = 0; path_i < g->lib_search_paths.length; path_i += 1) {
-                Buf *search_path = g->lib_search_paths.at(path_i);
-                os_path_join(search_path, import_target_path, &full_path);
-
-                Buf *abs_full_path = buf_alloc();
-                if ((err = os_path_real(&full_path, abs_full_path))) {
-                    if (err == ErrorFileNotFound) {
-                        continue;
-                    } else {
-                        g->error_during_imports = true;
-                        add_node_error(g, top_level_decl,
-                                buf_sprintf("unable to open '%s': %s", buf_ptr(&full_path), err_str(err)));
-                        goto done_looking_at_imports;
-                    }
-                }
-
-                auto entry = g->import_table.maybe_get(abs_full_path);
-                if (entry) {
-                    found_it = true;
-                    top_level_decl->data.import.import = entry->value;
-                } else {
-                    if ((err = os_fetch_file_path(abs_full_path, import_code))) {
-                        if (err == ErrorFileNotFound) {
-                            continue;
-                        } else {
-                            g->error_during_imports = true;
-                            add_node_error(g, top_level_decl,
-                                    buf_sprintf("unable to open '%s': %s", buf_ptr(&full_path), err_str(err)));
-                            goto done_looking_at_imports;
-                        }
-                    }
-                    top_level_decl->data.import.import = codegen_add_code(g,
-                            abs_full_path, search_path, &top_level_decl->data.import.path, import_code);
-                    found_it = true;
-                }
-                break;
-            }
-            if (!found_it) {
-                g->error_during_imports = true;
-                add_node_error(g, top_level_decl,
-                        buf_sprintf("unable to find '%s'", buf_ptr(import_target_path)));
-            }
-        } else if (top_level_decl->type == NodeTypeFnDef) {
-            AstNode *proto_node = top_level_decl->data.fn_def.fn_proto;
-            assert(proto_node->type == NodeTypeFnProto);
-            Buf *proto_name = &proto_node->data.fn_proto.name;
-
-            bool is_private = (proto_node->data.fn_proto.visib_mod == VisibModPrivate);
-
-            if (buf_eql_str(proto_name, "main") && !is_private) {
-                g->have_exported_main = true;
-            }
-        }
-    }
-
-done_looking_at_imports:
-
-    return import_entry;
-}
-
 static ImportTableEntry *add_special_code(CodeGen *g, const char *basename) {
     Buf *std_dir = buf_create_from_str(ZIG_STD_DIR);
     Buf *code_basename = buf_create_from_str(basename);
@@ -4013,7 +3825,7 @@ static ImportTableEntry *add_special_code(CodeGen *g, const char *basename) {
         zig_panic("unable to open '%s': %s", buf_ptr(&path_to_code_src), err_str(err));
     }
 
-    return codegen_add_code(g, abs_full_path, std_dir, code_basename, import_code);
+    return add_source_file(g, abs_full_path, std_dir, code_basename, import_code);
 }
 
 void codegen_add_root_code(CodeGen *g, Buf *src_dir, Buf *src_basename, Buf *source_code) {
@@ -4027,15 +3839,10 @@ void codegen_add_root_code(CodeGen *g, Buf *src_dir, Buf *src_basename, Buf *sou
         zig_panic("unable to open '%s': %s", buf_ptr(&source_path), err_str(err));
     }
 
-    g->root_import = codegen_add_code(g, abs_full_path, src_dir, src_basename, source_code);
+    g->root_import = add_source_file(g, abs_full_path, src_dir, src_basename, source_code);
 
-    if (!g->root_out_name) {
-        add_node_error(g, g->root_import->root,
-                buf_sprintf("missing export declaration and output name not provided"));
-    } else if (g->out_type == OutTypeUnknown) {
-        add_node_error(g, g->root_import->root,
-                buf_sprintf("missing export declaration and export type not provided"));
-    }
+    assert(g->root_out_name);
+    assert(g->out_type != OutTypeUnknown);
 
     if (!g->link_libc && !g->is_test_build) {
         if (g->have_exported_main && (g->out_type == OutTypeObj || g->out_type == OutTypeExe)) {
@@ -4120,7 +3927,7 @@ void codegen_generate_h_file(CodeGen *g) {
         assert(proto_node->type == NodeTypeFnProto);
         AstNodeFnProto *fn_proto = &proto_node->data.fn_proto;
 
-        if (fn_proto->visib_mod != VisibModExport)
+        if (fn_proto->top_level_decl.visib_mod != VisibModExport)
             continue;
 
         Buf return_type_c = BUF_INIT;

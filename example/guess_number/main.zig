@@ -1,17 +1,16 @@
 export executable "guess_number";
 
-import "std.zig";
-import "rand.zig";
-import "os.zig";
+use @import("std");
+use io;
 
 pub fn main(args: [][]u8) -> %void {
     %%stdout.printf("Welcome to the Guess Number Game in Zig.\n");
 
     var seed : u32 = undefined;
     const seed_bytes = (&u8)(&seed)[0...4];
-    %%os_get_random_bytes(seed_bytes);
+    %%os.get_random_bytes(seed_bytes);
 
-    var rand = rand_new(seed);
+    var rand = Rand.init(seed);
 
     const answer = rand.range_u64(0, 100) + 1;
 

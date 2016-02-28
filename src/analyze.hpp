@@ -16,7 +16,6 @@ TypeTableEntry *new_type_table_entry(TypeTableEntryId id);
 TypeTableEntry *get_pointer_to_type(CodeGen *g, TypeTableEntry *child_type, bool is_const);
 BlockContext *new_block_context(AstNode *node, BlockContext *parent);
 Expr *get_resolved_expr(AstNode *node);
-TopLevelDecl *get_resolved_top_level_decl(AstNode *node);
 bool is_node_void_expr(AstNode *node);
 TypeTableEntry **get_int_type_ptr(CodeGen *g, bool is_signed, int size_in_bits);
 TypeTableEntry *get_int_type(CodeGen *g, bool is_signed, int size_in_bits);
@@ -36,5 +35,9 @@ void find_libc_lib_path(CodeGen *g);
 TypeTableEntry *get_underlying_type(TypeTableEntry *type_entry);
 bool type_has_bits(TypeTableEntry *type_entry);
 uint64_t get_memcpy_align(CodeGen *g, TypeTableEntry *type_entry);
+
+
+ImportTableEntry *add_source_file(CodeGen *g, Buf *abs_full_path,
+        Buf *src_dirname, Buf *src_basename, Buf *source_code);
 
 #endif
